@@ -3,7 +3,7 @@ import binascii
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Dict, Iterable, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Union
 
 from asn1crypto import crl, ocsp, x509
 from asn1crypto.util import timezone
@@ -36,6 +36,9 @@ from .revinfo.archival import (
     process_legacy_ocsp_input,
 )
 from .revinfo.manager import RevinfoManager
+
+if TYPE_CHECKING:
+    from .evidence.collector import EvidenceCollector
 
 
 @dataclass(frozen=True)
@@ -91,6 +94,8 @@ class ValidationContext:
         trust_manager: Optional[TrustManager] = None,
         algorithm_usage_policy: Optional[AlgorithmUsagePolicy] = None,
         fetchers: Optional[Fetchers] = None,
+        collect_evidence: bool = False,
+        legacy_revocation_mode: Optional[str] = None,
     ):
         """
         :param trust_roots:
@@ -187,6 +192,21 @@ class ValidationContext:
             Internal API, to be elaborated.
         :param algorithm_usage_policy:
             Internal API, to be elaborated.
+
+        :param collect_evidence:
+            If ``True``, record a structured evidence report of the revocation
+            checks performed with this context, accessible through
+            :attr:`evidence_collector` and :meth:`build_evidence_report`.
+            The report only records materials and chains that actually
+            participated in a decision, together with their provenance
+            (provided, cache hit or fetched), the policy applied, and the
+            reasons for accept/reject/soft-fail. Defaults to ``False``.
+
+        :param legacy_revocation_mode:
+            Internal bookkeeping parameter recording the legacy
+            ``revocation_mode`` string (``soft-fail``, ``hard-fail`` or
+            ``require``) that was used to derive the revocation policy, if
+            any. Only used to annotate evidence reports.
         """
 
         if revinfo_policy is None:
@@ -194,6 +214,8 @@ class ValidationContext:
                 RevocationCheckingPolicy.from_legacy(revocation_mode),
                 retroactive_revinfo=retroactive_revinfo,
             )
+            if legacy_revocation_mode is None:
+                legacy_revocation_mode = revocation_mode
         elif revinfo_policy.expected_post_expiry_revinfo_time is not None:
             raise NotImplementedError(
                 "Dealing with post-expiry revocation info has not been "
@@ -318,6 +340,53 @@ class ValidationContext:
         )
 
         self._acceptable_ac_targets = acceptable_ac_targets
+
+        self._collect_evidence = collect_evidence
+        self._evidence_collector: Optional['EvidenceCollector'] = None
+        if collect_evidence:
+            from .evidence.collector import EvidenceCollector
+
+            self._evidence_collector = EvidenceCollector(
+                policy=self._revinfo_policy,
+                validation_time=moment,
+                best_signature_time=best_signature_time,
+                point_in_time_validation=point_in_time_validation,
+                time_tolerance=self.timing_params.time_tolerance,
+                fetching_allowed=self._revinfo_manager.fetching_allowed,
+                legacy_revocation_mode=legacy_revocation_mode,
+            )
+
+    @property
+    def evidence_collection_enabled(self) -> bool:
+        """
+        Whether this context records revocation evidence.
+        """
+        return self._collect_evidence
+
+    @property
+    def evidence_collector(self) -> Optional['EvidenceCollector']:
+        """
+        The :class:`EvidenceCollector` attached to this context, or ``None``
+        if evidence collection was not enabled.
+        """
+        return self._evidence_collector
+
+    def build_evidence_report(self):
+        """
+        Build the :class:`.RevocationEvidenceReport` accumulated so far.
+
+        :raises ValueError:
+            if evidence collection was not enabled when constructing the
+            context.
+        """
+        from .evidence.replay import build_report_from_context
+
+        if self._evidence_collector is None:
+            raise ValueError(
+                "Evidence collection is not enabled for this validation "
+                "context. Pass collect_evidence=True to ValidationContext."
+            )
+        return build_report_from_context(self)
 
     @property
     def revinfo_manager(self) -> RevinfoManager:

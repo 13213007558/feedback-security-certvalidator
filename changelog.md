@@ -1,6 +1,26 @@
 # changelog
 
 
+## Unreleased
+
+- Added optional revocation evidence reporting behind
+  `ValidationContext(collect_evidence=True)` and the new
+  `pyhanko_certvalidator.evidence` subpackage. Reports record only the
+  certificates, OCSP responses and CRLs that actually participated in each
+  revocation decision, together with their provenance (caller-provided,
+  cache hit or fetched), the policy applied, raw-byte digests,
+  thisUpdate/nextUpdate, revocation times, and the reason each material was
+  accepted or rejected. Correctly signed material that targets another
+  certificate or issuer is explicitly recorded as out of scope and never
+  counted as valid status evidence.
+- Added trustless offline replay (`replay_validation_offline`) that reruns
+  validation from a report plus separately stored raw bytes with networking
+  disabled. Replay requires the caller to supply trust roots and an
+  equivalent policy, re-validates every signature and scope check, and
+  explains why the original run accepted, rejected or merely soft-failed,
+  rather than echoing the last exception.
+
+
 ## 0.26.8
 
 - Fixed bug where an HTTP(S) CRL URI appearing next to

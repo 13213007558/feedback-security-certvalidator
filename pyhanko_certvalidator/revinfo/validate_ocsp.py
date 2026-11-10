@@ -35,6 +35,11 @@ from pyhanko_certvalidator.registry import (
     SimpleCertificateStore,
 )
 from pyhanko_certvalidator.revinfo._err_gather import Errors
+from pyhanko_certvalidator.evidence.model import (
+    MaterialKind,
+    MaterialSource,
+    OCSPCertStatus,
+)
 from pyhanko_certvalidator.revinfo.archival import (
     OCSPContainer,
     RevinfoUsabilityRating,
@@ -173,10 +178,22 @@ def _match_ocsp_certid(
     ocsp_response: OCSPContainer,
     errs: _OCSPErrs,
 ) -> bool:
+    matched, _ = _match_ocsp_certid_with_reason(
+        cert, issuer, ocsp_response, errs
+    )
+    return matched
+
+
+def _match_ocsp_certid_with_reason(
+    cert: Union[x509.Certificate, cms.AttributeCertificateV2],
+    issuer: Authority,
+    ocsp_response: OCSPContainer,
+    errs: _OCSPErrs,
+):
     cert_response = ocsp_response.extract_single_response()
     if cert_response is None:
         errs.mismatch_failures += 1
-        return False
+        return False, "response contains no parseable SingleResponse"
 
     response_cert_id = cert_response['cert_id']
 
@@ -205,27 +222,41 @@ def _match_ocsp_certid(
 
     if (name_mismatch or serial_mismatch) and key_hash_mismatch:
         errs.mismatch_failures += 1
-        return False
+        reasons = []
+        if name_mismatch:
+            reasons.append('issuer name hash')
+        if serial_mismatch:
+            reasons.append('serial number')
+        reasons.append('issuer key hash')
+        return (
+            False,
+            "CertID targets a different certificate/issuer (mismatched "
+            + ', '.join(reasons)
+            + ")",
+        )
 
     if name_mismatch:
         errs.append(
             'OCSP response issuer name hash does not match', ocsp_response
         )
-        return False
+        return False, "OCSP response issuer name hash does not match"
 
     if serial_mismatch:
         errs.append(
             'OCSP response certificate serial number does not match',
             ocsp_response,
         )
-        return False
+        return (
+            False,
+            "OCSP response certificate serial number does not match",
+        )
 
     if key_hash_mismatch:
         errs.append(
             'OCSP response issuer key hash does not match', ocsp_response
         )
-        return False
-    return True
+        return False, "OCSP response issuer key hash does not match"
+    return True, "CertID matches certificate and issuer"
 
 
 def _identify_responder_cert(
@@ -398,33 +429,69 @@ def _verify_ocsp_signature(
     return False
 
 
+@dataclass(frozen=True)
+class _OCSPRelevanceResult:
+    responder_cert: Optional[x509.Certificate]
+    cert_id_matched: bool
+    cert_id_reason: str
+    signature_valid: bool
+    cert_status: Optional[OCSPCertStatus]
+
+
+def _read_ocsp_cert_status(
+    ocsp_response: OCSPContainer,
+) -> Optional[OCSPCertStatus]:
+    cert_response = ocsp_response.extract_single_response()
+    if cert_response is None:
+        return None
+    status_name = cert_response['cert_status'].name
+    return OCSPCertStatus(status_name)
+
+
 def _assess_ocsp_relevance(
     cert: Union[x509.Certificate, cms.AttributeCertificateV2],
     issuer: Authority,
     ocsp_response: OCSPContainer,
     cert_store: CertificateCollection,
     errs: _OCSPErrs,
-) -> Optional[x509.Certificate]:
-    matched = _match_ocsp_certid(
+) -> _OCSPRelevanceResult:
+    matched, match_reason = _match_ocsp_certid_with_reason(
         cert, issuer=issuer, ocsp_response=ocsp_response, errs=errs
     )
+    cert_status = _read_ocsp_cert_status(ocsp_response)
     if not matched:
-        return None
+        return _OCSPRelevanceResult(
+            responder_cert=None,
+            cert_id_matched=False,
+            cert_id_reason=match_reason,
+            signature_valid=False,
+            cert_status=cert_status,
+        )
 
     responder_cert = _identify_responder_cert(
         ocsp_response, cert_store=cert_store, errs=errs
     )
     if not responder_cert:
-        return None
+        return _OCSPRelevanceResult(
+            responder_cert=None,
+            cert_id_matched=True,
+            cert_id_reason=match_reason,
+            signature_valid=False,
+            cert_status=cert_status,
+        )
 
     signature_ok = _verify_ocsp_signature(
         responder_key=responder_cert.public_key,
         ocsp_response=ocsp_response,
         errs=errs,
     )
-    if not signature_ok:
-        return None
-    return responder_cert
+    return _OCSPRelevanceResult(
+        responder_cert=responder_cert,
+        cert_id_matched=True,
+        cert_id_reason=match_reason,
+        signature_valid=signature_ok,
+        cert_status=cert_status,
+    )
 
 
 async def _handle_single_ocsp_resp(
@@ -436,14 +503,72 @@ async def _handle_single_ocsp_resp(
     errs: _OCSPErrs,
     proc_state: ValProcState,
 ) -> bool:
-    responder_cert = _assess_ocsp_relevance(
+    relevance = _assess_ocsp_relevance(
         cert=cert,
         issuer=issuer,
         ocsp_response=ocsp_response,
         cert_store=validation_context.certificate_registry,
         errs=errs,
     )
-    if responder_cert is None:
+    collector = validation_context.evidence_collector
+    source = (
+        validation_context.revinfo_manager.ocsp_provenance(ocsp_response)
+        if collector is not None
+        else MaterialSource.PROVIDED
+    )
+    issuer_cert = (
+        issuer.certificate
+        if isinstance(issuer, AuthorityWithCert)
+        else None
+    )
+
+    def _record(
+        accepted: bool,
+        selection_reason: str,
+        *,
+        responder_authorised: bool = False,
+        freshness_rating: str = 'unclear',
+        responder_cert=None,
+    ):
+        if collector is None or issuer_cert is None:
+            return
+        collector.record_ocsp_attempt(
+            cert=cert,
+            issuer=issuer_cert,
+            is_ee_cert=proc_state.is_ee_cert,
+            container=ocsp_response,
+            source=source,
+            cert_id_matched=relevance.cert_id_matched,
+            cert_status=relevance.cert_status,
+            signature_valid=relevance.signature_valid,
+            responder_authorised=responder_authorised,
+            freshness_rating=freshness_rating,
+            accepted=accepted,
+            selection_reason=selection_reason,
+            responder_cert=responder_cert,
+        )
+
+    if relevance.responder_cert is None:
+        if not relevance.cert_id_matched:
+            reason = relevance.cert_id_reason
+        elif not relevance.signature_valid:
+            reason = (
+                "response signature could not be verified or the responder "
+                "certificate could not be located"
+            )
+        else:  # pragma: no cover
+            reason = "response was not considered relevant"
+        _record(False, reason)
+        return False
+
+    responder_cert = relevance.responder_cert
+    if not relevance.signature_valid:
+        _record(
+            False,
+            "OCSP response signature could not be verified with the "
+            "identified responder certificate",
+            responder_cert=responder_cert,
+        )
         return False
 
     freshness_result = ocsp_response.usable_at(
@@ -460,6 +585,12 @@ async def _handle_single_ocsp_resp(
         else:
             msg = 'OCSP response freshness could not be established'
         errs.append(msg, ocsp_response, is_freshness_failure=True)
+        _record(
+            False,
+            msg,
+            freshness_rating=rating.name.lower(),
+            responder_cert=responder_cert,
+        )
         return False
 
     # check whether the responder cert is authorised
@@ -474,13 +605,53 @@ async def _handle_single_ocsp_resp(
         proc_state=proc_state,
     )
     if not authorised:
+        _record(
+            False,
+            "responder certificate was not authorised to answer for the "
+            "issuer, or its provenance could not be validated",
+            freshness_rating=rating.name.lower(),
+            responder_cert=responder_cert,
+        )
         return False
 
     timing = validation_context.timing_params
     control_time = (
         timing.validation_time if timing.point_in_time_validation else None
     )
-    return _check_ocsp_status(ocsp_response, proc_state, control_time)
+    try:
+        good = _check_ocsp_status(ocsp_response, proc_state, control_time)
+    except RevokedError:
+        _record(
+            False,
+            "in-scope OCSP response with valid signature, authorised "
+            "responder and fresh timing reports the certificate revoked at "
+            "or before the validation time",
+            responder_authorised=True,
+            freshness_rating=rating.name.lower(),
+            responder_cert=responder_cert,
+        )
+        raise
+    if good:
+        selection_reason = (
+            "in-scope OCSP response with valid signature, authorised "
+            "responder and fresh timing reports status good"
+        )
+    else:
+        # status revoked at a point in the future relative to the control
+        # time does not raise, but also does not establish "good"; the
+        # response remains valid evidence of a not-yet-effective revocation
+        selection_reason = (
+            "in-scope OCSP response reports a revocation that is not yet "
+            "effective at the validation time"
+        )
+    _record(
+        good,
+        selection_reason,
+        responder_authorised=True,
+        freshness_rating=rating.name.lower(),
+        responder_cert=responder_cert,
+    )
+    return good
 
 
 async def verify_ocsp_response(
@@ -552,6 +723,28 @@ async def verify_ocsp_response(
             msg = "Generic processing error while validating OCSP response."
             logging.debug(msg, exc_info=e)
             errs.append(msg, ocsp_response)
+
+    collector = validation_context.evidence_collector
+    if collector is not None and isinstance(
+        cert_issuer, AuthorityWithCert
+    ) and isinstance(cert, x509.Certificate):
+        if not ocsp_responses:
+            collector.record_unavailable(
+                cert=cert,
+                issuer=cert_issuer.certificate,
+                is_ee_cert=proc_state.is_ee_cert,
+                kind=MaterialKind.OCSP,
+                reason="no OCSP responses available",
+            )
+        elif errs.mismatch_failures == len(ocsp_responses):
+            collector.record_unavailable(
+                cert=cert,
+                issuer=cert_issuer.certificate,
+                is_ee_cert=proc_state.is_ee_cert,
+                kind=MaterialKind.OCSP,
+                reason="no available OCSP response targets this certificate "
+                "and issuer",
+            )
 
     if errs.mismatch_failures == len(ocsp_responses):
         raise OCSPNoMatchesError(
@@ -645,14 +838,15 @@ async def collect_relevant_responses_with_paths(
             # We don't care about responses issued after control_time
             continue
         try:
-            responder_cert = _assess_ocsp_relevance(
+            relevance = _assess_ocsp_relevance(
                 cert=cert,
                 issuer=cert_issuer_auth,
                 ocsp_response=ocsp_response_cont,
                 cert_store=revinfo_manager.certificate_registry,
                 errs=errs,
             )
-            if responder_cert is None:
+            responder_cert = relevance.responder_cert
+            if responder_cert is None or not relevance.signature_valid:
                 continue
             path = _delegated_ocsp_response_path(
                 responder_cert, cert_issuer_auth, ee_path=path

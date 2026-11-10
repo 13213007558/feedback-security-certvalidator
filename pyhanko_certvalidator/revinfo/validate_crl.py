@@ -21,6 +21,7 @@ from pyhanko_certvalidator.errors import (
     PSSParameterMismatch,
     RevokedError,
 )
+from pyhanko_certvalidator.evidence.model import MaterialSource
 from pyhanko_certvalidator.ltv.poe import POEManager
 from pyhanko_certvalidator.ltv.types import ValidationTimingParams
 from pyhanko_certvalidator.path import ValidationPath
@@ -561,6 +562,54 @@ async def _handle_single_crl(
     proc_state: ValProcState,
 ) -> Optional[Set[str]]:
     certificate_list = certificate_list_cont.crl_data
+    collector = validation_context.evidence_collector
+    source = (
+        validation_context.revinfo_manager.crl_provenance(
+            certificate_list_cont
+        )
+        if collector is not None
+        else MaterialSource.PROVIDED
+    )
+    issuer_cert = (
+        cert_issuer_auth.certificate
+        if isinstance(cert_issuer_auth, AuthorityWithCert)
+        else None
+    )
+
+    def _record(
+        accepted: bool,
+        selection_reason: str,
+        *,
+        issuer_matched: bool = False,
+        scope_reasons: Optional[Set[str]] = None,
+        signature_valid: bool = False,
+        issuer_path_validated: bool = False,
+        freshness_rating: str = 'unclear',
+        cert_listed: bool = False,
+        revocation_time: Optional[datetime] = None,
+        revocation_reason: Optional[str] = None,
+        crl_issuer_cert=None,
+    ):
+        if collector is None or issuer_cert is None:
+            return
+        collector.record_crl_attempt(
+            cert=cert,
+            issuer=issuer_cert,
+            is_ee_cert=proc_state.is_ee_cert,
+            container=certificate_list_cont,
+            source=source,
+            issuer_matched=issuer_matched,
+            scope_reasons=list(scope_reasons or ()),
+            signature_valid=signature_valid,
+            issuer_path_validated=issuer_path_validated,
+            freshness_rating=freshness_rating,
+            cert_listed=cert_listed,
+            accepted=accepted,
+            selection_reason=selection_reason,
+            revocation_time=revocation_time,
+            revocation_reason=revocation_reason,
+            crl_issuer_cert=crl_issuer_cert,
+        )
 
     try:
         is_indirect, crl_authority_name = _get_crl_authority_name(
@@ -570,6 +619,10 @@ async def _handle_single_crl(
             errs=errs,
         )
     except LookupError:
+        _record(
+            False,
+            "CRL authority could not be identified from the CRL content",
+        )
         # already logged by _get_crl_authority_name
         return None
 
@@ -577,6 +630,7 @@ async def _handle_single_crl(
     crl_issuer = validation_context.revinfo_manager.check_crl_issuer(
         certificate_list
     )
+    issuer_path_validated = crl_issuer is not None
     # if not, attempt to determine it
     if not crl_issuer:
         try:
@@ -591,11 +645,23 @@ async def _handle_single_crl(
                 proc_state=proc_state,
             )
             crl_issuer = crl_issuer_path.last
+            issuer_path_validated = True
         except CRLNoMatchesError:
             # this no-match issue will be dealt with at a higher level later
             errs.issuer_failures += 1
+            _record(
+                False,
+                "no certificate eligible to sign this CRL could be located "
+                "for the certificate's issuer",
+                issuer_matched=False,
+            )
             return None
         except (CertificateFetchError, CRLValidationError) as e:
+            _record(
+                False,
+                f"CRL issuer validation failed: {e.args[0]}",
+                issuer_matched=False,
+            )
             errs.append(e.args[0], certificate_list)
             return None
 
@@ -608,15 +674,40 @@ async def _handle_single_crl(
     )
 
     if interim_reasons is None:
+        _record(
+            False,
+            "CRL issuer/IDP scope does not cover this certificate",
+            issuer_matched=False,
+            signature_valid=True,
+            issuer_path_validated=issuer_path_validated,
+            crl_issuer_cert=crl_issuer,
+        )
         return None
 
-    if not _check_crl_freshness(
+    freshness_result = certificate_list_cont.usable_at(
+        policy=validation_context.revinfo_policy,
+        timing_params=validation_context.timing_params,
+    )
+    freshness_ok = _check_crl_freshness(
         certificate_list_cont,
         validation_context.revinfo_policy,
         validation_context.timing_params,
         errs,
         is_delta=False,
-    ):
+    )
+    freshness_rating = freshness_result.rating.name.lower()
+    if not freshness_ok:
+        _record(
+            False,
+            f"CRL failed the freshness policy (rating: "
+            f"{freshness_rating})",
+            issuer_matched=True,
+            scope_reasons=interim_reasons,
+            signature_valid=True,
+            issuer_path_validated=issuer_path_validated,
+            freshness_rating=freshness_rating,
+            crl_issuer_cert=crl_issuer,
+        )
         return None
 
     # Step c
@@ -642,19 +733,72 @@ async def _handle_single_crl(
         )
     except NotImplementedError:
         # the subroutine already registered the failure, so just bail
+        _record(
+            False,
+            "CRL entry contains unrecognised critical extensions",
+            issuer_matched=True,
+            scope_reasons=interim_reasons,
+            signature_valid=True,
+            issuer_path_validated=issuer_path_validated,
+            freshness_rating=freshness_rating,
+            crl_issuer_cert=crl_issuer,
+        )
         return None
+
+    cert_listed = revoked_reason is not None
+    revocation_reason_str = (
+        revoked_reason.native if revoked_reason is not None else None
+    )
 
     timing = validation_context.timing_params
     control_time = (
         timing.validation_time if timing.point_in_time_validation else None
     )
     if revoked_reason and (control_time is None or revoked_date < control_time):
+        _record(
+            False,
+            "in-scope, fresh CRL lists the certificate as revoked at or "
+            "before the validation time",
+            issuer_matched=True,
+            scope_reasons=interim_reasons,
+            signature_valid=True,
+            issuer_path_validated=True,
+            freshness_rating=freshness_rating,
+            cert_listed=True,
+            revocation_time=revoked_date,
+            revocation_reason=revocation_reason_str,
+            crl_issuer_cert=crl_issuer,
+        )
         raise RevokedError.format(
             reason=revoked_reason,
             revocation_dt=revoked_date,
             revinfo_type='CRL',
             proc_state=proc_state,
         )
+
+    if cert_listed:
+        selection_reason = (
+            "in-scope, fresh CRL lists the certificate, but the revocation "
+            "is not yet effective at the validation time"
+        )
+    else:
+        selection_reason = (
+            "in-scope, fresh CRL with validated issuer does not list the "
+            "certificate; treated as not revoked for the covered reasons"
+        )
+    _record(
+        True,
+        selection_reason,
+        issuer_matched=True,
+        scope_reasons=interim_reasons,
+        signature_valid=True,
+        issuer_path_validated=True,
+        freshness_rating=freshness_rating,
+        cert_listed=cert_listed,
+        revocation_time=revoked_date,
+        revocation_reason=revocation_reason_str,
+        crl_issuer_cert=crl_issuer,
+    )
     return interim_reasons
 
 

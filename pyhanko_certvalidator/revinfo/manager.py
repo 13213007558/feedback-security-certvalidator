@@ -14,6 +14,11 @@ from asn1crypto import crl, ocsp, x509
 
 from pyhanko_certvalidator.authority import Authority
 from pyhanko_certvalidator.errors import CRLFetchError, OCSPFetchError
+from pyhanko_certvalidator.evidence.model import (
+    CRL_HASH,
+    OCSP_HASH,
+    MaterialSource,
+)
 from pyhanko_certvalidator.fetchers import Fetchers
 from pyhanko_certvalidator.ltv.poe import (
     KnownPOE,
@@ -80,6 +85,57 @@ class RevinfoManager:
         self._assertions: Dict[bytes, NonRevokedStatusAssertion] = {
             assertion.cert_sha256: assertion for assertion in assertions
         }
+        # provenance of each piece of material by raw-bytes digest.
+        # Caller-supplied material is "provided"; fetcher caches are "cache";
+        # material downloaded during this run is "fetched". The first
+        # attribution wins, so re-fetching identical bytes never upgrades
+        # a provided/cached item to "fetched".
+        self._revinfo_provenance: Dict[str, MaterialSource] = {}
+        for cont in self._crls:
+            self._record_provenance(
+                CRL_HASH(cont.crl_data), MaterialSource.PROVIDED
+            )
+        for cont in self._ocsps:
+            self._record_provenance(
+                OCSP_HASH(cont.ocsp_response_data), MaterialSource.PROVIDED
+            )
+
+    def _record_provenance(
+        self, digest_hex: str, source: MaterialSource
+    ) -> MaterialSource:
+        return self._revinfo_provenance.setdefault(digest_hex, source)
+
+    def ocsp_provenance(self, container: OCSPContainer) -> MaterialSource:
+        """
+        Return the recorded provenance of an OCSP response container.
+        Defaults to :attr:`MaterialSource.PROVIDED` when no fetch ever
+        occurred, since such material can only have been supplied locally.
+        """
+
+        digest_hex = OCSP_HASH(container.ocsp_response_data)
+        source = self._revinfo_provenance.get(digest_hex)
+        if source is not None:
+            return source
+        if not self._fetchers:
+            return MaterialSource.PROVIDED
+        # material living in a fetcher cache but never seen locally:
+        # that is a cache hit by definition
+        source = MaterialSource.CACHE
+        return self._record_provenance(digest_hex, source)
+
+    def crl_provenance(self, container: CRLContainer) -> MaterialSource:
+        """
+        Return the recorded provenance of a CRL container.
+        """
+
+        digest_hex = CRL_HASH(container.crl_data)
+        source = self._revinfo_provenance.get(digest_hex)
+        if source is not None:
+            return source
+        if not self._fetchers:
+            return MaterialSource.PROVIDED
+        source = MaterialSource.CACHE
+        return self._record_provenance(digest_hex, source)
 
     @property
     def poe_manager(self) -> POEManager:
@@ -111,7 +167,10 @@ class RevinfoManager:
         raw_crls = [cont.crl_data for cont in self._crls]
         if not self._fetchers:
             return raw_crls
-        return list(self._fetchers.crl_fetcher.fetched_crls()) + raw_crls
+        fetched = list(self._fetchers.crl_fetcher.fetched_crls())
+        for crl_data in fetched:
+            self._record_provenance(CRL_HASH(crl_data), MaterialSource.CACHE)
+        return fetched + raw_crls
 
     @property
     def ocsps(self) -> List[ocsp.OCSPResponse]:
@@ -123,7 +182,12 @@ class RevinfoManager:
         if not self._fetchers:
             return raw_ocsps
 
-        return list(self._fetchers.ocsp_fetcher.fetched_responses()) + raw_ocsps
+        fetched = list(self._fetchers.ocsp_fetcher.fetched_responses())
+        for ocsp_data in fetched:
+            self._record_provenance(
+                OCSP_HASH(ocsp_data), MaterialSource.CACHE
+            )
+        return fetched + raw_ocsps
 
     @property
     def new_revocation_certs(self) -> List[x509.Certificate]:
@@ -210,7 +274,14 @@ class RevinfoManager:
         result = list(self._crls)
         if self._fetchers:
             crls = self._fetchers.crl_fetcher.fetched_crls()
-            result.extend(CRLContainer(crl_data) for crl_data in crls)
+            for crl_data in crls:
+                cont = CRLContainer(crl_data)
+                # anything served from the fetcher without a fresh fetch
+                # is a cache hit
+                self._record_provenance(
+                    CRL_HASH(crl_data), MaterialSource.CACHE
+                )
+                result.append(cont)
         return result
 
     async def fetch_crls(self, cert) -> List[CRLContainer]:
@@ -231,9 +302,18 @@ class RevinfoManager:
         fetchers = self._fetchers
         try:
             crls = fetchers.crl_fetcher.fetched_crls_for_cert(cert)
+            conts = [CRLContainer(crl_data) for crl_data in crls]
+            for cont in conts:
+                self._record_provenance(
+                    CRL_HASH(cont.crl_data), MaterialSource.CACHE
+                )
         except KeyError:
             crls = await fetchers.crl_fetcher.fetch(cert)
-        conts = [CRLContainer(crl_data) for crl_data in crls]
+            conts = [CRLContainer(crl_data) for crl_data in crls]
+            for cont in conts:
+                self._record_provenance(
+                    CRL_HASH(cont.crl_data), MaterialSource.FETCHED
+                )
         return conts
 
     async def async_retrieve_crls(self, cert) -> List[CRLContainer]:
@@ -292,6 +372,17 @@ class RevinfoManager:
                         "Failed to extract certificates from "
                         "fetched OCSP response"
                     )
+            for resp in ocsps:
+                self._record_provenance(
+                    OCSP_HASH(resp.ocsp_response_data),
+                    MaterialSource.FETCHED,
+                )
+        else:
+            for resp in ocsps:
+                self._record_provenance(
+                    OCSP_HASH(resp.ocsp_response_data),
+                    MaterialSource.CACHE,
+                )
 
         return ocsps + self._ocsps
 

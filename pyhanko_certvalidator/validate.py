@@ -31,6 +31,7 @@ from .errors import (
     PathBuildingError,
     PathValidationError,
     PSSParameterMismatch,
+    RevokedError,
     StaleRevinfoError,
     ValidationError,
 )
@@ -57,6 +58,12 @@ from .policy_tree import (
     update_policy_tree,
 )
 from .registry import CertificateCollection
+from .authority import AuthorityWithCert
+from .evidence.model import (
+    EvidenceOutcome,
+    MaterialKind,
+    RevocationDecision,
+)
 from .revinfo.validate_crl import verify_crl
 from .revinfo.validate_ocsp import verify_ocsp_response
 from .util import (
@@ -1201,6 +1208,10 @@ async def intl_validate_path(
         # TODO cache valid policies on intermediate certs too?
         completed_path._set_qualified_policies(qualified_policies)
 
+    collector = validation_context.evidence_collector
+    if collector is not None and not proc_state.is_side_validation:
+        collector.record_path(path)
+
     return cert
 
 
@@ -1306,6 +1317,32 @@ async def _check_revocation(
         else rev_check_policy.intermediate_ca_cert_rule
     )
 
+    collector = validation_context.evidence_collector
+    issuer_cert = None
+    try:
+        issuing_authority = path.find_issuing_authority(cert)
+        if isinstance(issuing_authority, AuthorityWithCert):
+            issuer_cert = issuing_authority.certificate
+    except LookupError:
+        issuing_authority = None
+
+    def _soft_fail(kind: MaterialKind, exc: Exception):
+        nonlocal soft_fail
+        soft_fail = True
+        validation_context._report_soft_fail(exc)
+        if (
+            collector is not None
+            and issuer_cert is not None
+            and isinstance(cert, x509.Certificate)
+        ):
+            collector.record_soft_fail(
+                cert=cert,
+                issuer=issuer_cert,
+                is_ee_cert=proc_state.is_ee_cert,
+                kind=kind,
+                exception=exc,
+            )
+
     ocsp_suspect_stale_since = None
     # for OCSP, we don't bother if there's nothing in the certificate's AIA
     if rev_rule.ocsp_relevant and cert_has_ocsp:
@@ -1315,6 +1352,16 @@ async def _check_revocation(
             )
             ocsp_status_good = True
             ocsp_matched = True
+        except RevokedError as e:
+            _finalize_revoked_evidence(
+                cert=cert,
+                issuer_cert=issuer_cert,
+                validation_context=validation_context,
+                proc_state=proc_state,
+                revinfo_type='OCSP response',
+                exc=e,
+            )
+            raise
         except OCSPValidationIndeterminateError as e:
             failures.extend([failure[0] for failure in e.failures])
             revocation_check_failed = True
@@ -1324,8 +1371,7 @@ async def _check_revocation(
             pass
         except OCSPFetchError as e:
             if rev_rule.tolerant:
-                soft_fail = True
-                validation_context._report_soft_fail(e)
+                _soft_fail(MaterialKind.OCSP, e)
             else:
                 failures.append(e.args[0])
                 revocation_check_failed = True
@@ -1343,10 +1389,34 @@ async def _check_revocation(
             f"check(s) for {proc_state.describe_cert()} failed: {err_str}"
         )
         if ocsp_suspect_stale_since:
+            _finalize_failed_evidence(
+                cert=cert,
+                issuer_cert=issuer_cert,
+                validation_context=validation_context,
+                proc_state=proc_state,
+                reason=f"Mandatory OCSP check failed: {msg}",
+                rev_rule=rev_rule,
+                cert_has_ocsp=cert_has_ocsp,
+                cert_has_crl=cert_has_crl,
+                ocsp_status_good=ocsp_status_good,
+                crl_status_good=crl_status_good,
+            )
             raise StaleRevinfoError.format(
                 msg, ocsp_suspect_stale_since, proc_state
             )
         else:
+            _finalize_failed_evidence(
+                cert=cert,
+                issuer_cert=issuer_cert,
+                validation_context=validation_context,
+                proc_state=proc_state,
+                reason=f"Mandatory OCSP check failed: {msg}",
+                rev_rule=rev_rule,
+                cert_has_ocsp=cert_has_ocsp,
+                cert_has_crl=cert_has_crl,
+                ocsp_status_good=ocsp_status_good,
+                crl_status_good=crl_status_good,
+            )
             raise InsufficientRevinfoError.from_state(msg, proc_state)
     status_good = (
         ocsp_status_good
@@ -1370,6 +1440,16 @@ async def _check_revocation(
             revocation_check_failed = False
             crl_status_good = True
             crl_matched = True
+        except RevokedError as e:
+            _finalize_revoked_evidence(
+                cert=cert,
+                issuer_cert=issuer_cert,
+                validation_context=validation_context,
+                proc_state=proc_state,
+                revinfo_type='CRL',
+                exc=e,
+            )
+            raise
         except CRLValidationIndeterminateError as e:
             failures.extend([failure[0] for failure in e.failures])
             revocation_check_failed = True
@@ -1379,8 +1459,7 @@ async def _check_revocation(
             pass
         except CRLFetchError as e:
             if rev_rule.tolerant:
-                soft_fail = True
-                validation_context._report_soft_fail(e)
+                _soft_fail(MaterialKind.CRL, e)
             else:
                 failures.append(e.args[0])
                 revocation_check_failed = True
@@ -1395,10 +1474,34 @@ async def _check_revocation(
             f"check(s) for {proc_state.describe_cert()} failed: {err_str}"
         )
         if crl_suspect_stale_since:
+            _finalize_failed_evidence(
+                cert=cert,
+                issuer_cert=issuer_cert,
+                validation_context=validation_context,
+                proc_state=proc_state,
+                reason=f"Mandatory CRL check failed: {msg}",
+                rev_rule=rev_rule,
+                cert_has_ocsp=cert_has_ocsp,
+                cert_has_crl=cert_has_crl,
+                ocsp_status_good=ocsp_status_good,
+                crl_status_good=crl_status_good,
+            )
             raise StaleRevinfoError.format(
                 msg, crl_suspect_stale_since, proc_state
             )
         else:
+            _finalize_failed_evidence(
+                cert=cert,
+                issuer_cert=issuer_cert,
+                validation_context=validation_context,
+                proc_state=proc_state,
+                reason=f"Mandatory CRL check failed: {msg}",
+                rev_rule=rev_rule,
+                cert_has_ocsp=cert_has_ocsp,
+                cert_has_crl=cert_has_crl,
+                ocsp_status_good=ocsp_status_good,
+                crl_status_good=crl_status_good,
+            )
             raise InsufficientRevinfoError.from_state(
                 msg,
                 proc_state,
@@ -1432,18 +1535,282 @@ async def _check_revocation(
                     if ocsp_suspect_stale_since and crl_suspect_stale_since
                     else maybe_stale_cutoff
                 )
+                _finalize_failed_evidence(
+                    cert=cert,
+                    issuer_cert=issuer_cert,
+                    validation_context=validation_context,
+                    proc_state=proc_state,
+                    reason=msg,
+                    rev_rule=rev_rule,
+                    cert_has_ocsp=cert_has_ocsp,
+                    cert_has_crl=cert_has_crl,
+                    ocsp_status_good=ocsp_status_good,
+                    crl_status_good=crl_status_good,
+                )
                 raise StaleRevinfoError.format(msg, stale_cutoff, proc_state)
             else:
+                _finalize_failed_evidence(
+                    cert=cert,
+                    issuer_cert=issuer_cert,
+                    validation_context=validation_context,
+                    proc_state=proc_state,
+                    reason=msg,
+                    rev_rule=rev_rule,
+                    cert_has_ocsp=cert_has_ocsp,
+                    cert_has_crl=cert_has_crl,
+                    ocsp_status_good=ocsp_status_good,
+                    crl_status_good=crl_status_good,
+                )
                 raise InsufficientRevinfoError.from_state(
                     msg,
                     proc_state,
                 )
         if expected_revinfo_not_found:
-            raise InsufficientRevinfoError.from_state(
+            msg = (
                 f"The path could not be validated because no revocation "
-                f"information could be found for {proc_state.describe_cert()}",
+                f"information could be found for {proc_state.describe_cert()}"
+            )
+            _finalize_failed_evidence(
+                cert=cert,
+                issuer_cert=issuer_cert,
+                validation_context=validation_context,
+                proc_state=proc_state,
+                reason=msg,
+                rev_rule=rev_rule,
+                cert_has_ocsp=cert_has_ocsp,
+                cert_has_crl=cert_has_crl,
+                ocsp_status_good=ocsp_status_good,
+                crl_status_good=crl_status_good,
+            )
+            raise InsufficientRevinfoError.from_state(
+                msg,
                 proc_state,
             )
+
+    _finalize_revocation_evidence(
+        cert=cert,
+        issuer_cert=issuer_cert,
+        validation_context=validation_context,
+        proc_state=proc_state,
+        ocsp_status_good=ocsp_status_good,
+        crl_status_good=crl_status_good,
+        matched=matched,
+        soft_fail=soft_fail,
+        expected_revinfo=expected_revinfo,
+        expected_revinfo_not_found=expected_revinfo_not_found,
+        revocation_check_failed=revocation_check_failed,
+        cert_has_ocsp=cert_has_ocsp,
+        cert_has_crl=cert_has_crl,
+        rev_rule=rev_rule,
+    )
+
+
+def _finalize_revocation_evidence(
+    *,
+    cert,
+    issuer_cert,
+    validation_context: ValidationContext,
+    proc_state: ValProcState,
+    ocsp_status_good: bool,
+    crl_status_good: bool,
+    matched: bool,
+    soft_fail: bool,
+    expected_revinfo: bool,
+    expected_revinfo_not_found: bool,
+    revocation_check_failed: bool,
+    cert_has_ocsp: bool,
+    cert_has_crl: bool,
+    rev_rule: RevocationCheckingRule,
+):
+    collector = validation_context.evidence_collector
+    if collector is None or issuer_cert is None:
+        return
+    if not isinstance(cert, x509.Certificate):
+        return
+
+    if ocsp_status_good or crl_status_good:
+        outcome = EvidenceOutcome.GOOD
+        decision = RevocationDecision.ACCEPTED
+        if ocsp_status_good and crl_status_good:
+            explanation = (
+                "both an in-scope OCSP response and an in-scope CRL "
+                "positively established non-revocation"
+            )
+        elif ocsp_status_good:
+            explanation = (
+                "an in-scope OCSP response positively established "
+                "non-revocation; CRL evidence was not required to decide"
+            )
+        else:
+            explanation = (
+                "an in-scope CRL with a validated issuer did not list the "
+                "certificate, establishing non-revocation for the covered "
+                "reasons"
+            )
+    elif soft_fail:
+        outcome = EvidenceOutcome.UNKNOWN
+        decision = RevocationDecision.SOFT_FAIL_CONTINUED
+        explanation = (
+            "no definitive status could be established, but the configured "
+            "revocation rule tolerates the failure; validation continued "
+            "under soft-fail"
+        )
+        if expected_revinfo_not_found:
+            explanation = (
+                "revocation information was expected but could not be "
+                "obtained; the tolerant revocation rule allowed validation "
+                "to continue under soft-fail"
+            )
+    else:
+        # reaching this point means no exception was raised: the rule must
+        # not require revinfo (e.g. check-if-declared with nothing declared)
+        outcome = EvidenceOutcome.UNKNOWN
+        decision = RevocationDecision.SOFT_FAIL_CONTINUED
+        if not (cert_has_ocsp or cert_has_crl):
+            explanation = (
+                "the certificate declares no OCSP/CRL access locations and "
+                "the policy does not require revocation information, so no "
+                "revocation check was applicable"
+            )
+        elif not matched:
+            explanation = (
+                "no available revocation material had jurisdiction over "
+                "this certificate, and policy did not require a match"
+            )
+        else:
+            explanation = (
+                "revocation checks were inconclusive but policy did not "
+                "treat this as disqualifying"
+            )
+
+    if (
+        rev_rule.ocsp_relevant
+        and cert_has_ocsp
+        and not ocsp_status_good
+        and not _has_material(collector, cert, MaterialKind.OCSP)
+    ):
+        collector.record_unavailable(
+            cert=cert,
+            issuer=issuer_cert,
+            is_ee_cert=proc_state.is_ee_cert,
+            kind=MaterialKind.OCSP,
+            reason="no usable OCSP evidence contributed to the decision",
+        )
+    if (
+        rev_rule.crl_relevant
+        and cert_has_crl
+        and not crl_status_good
+        and not _has_material(collector, cert, MaterialKind.CRL)
+    ):
+        collector.record_unavailable(
+            cert=cert,
+            issuer=issuer_cert,
+            is_ee_cert=proc_state.is_ee_cert,
+            kind=MaterialKind.CRL,
+            reason="no usable CRL evidence contributed to the decision",
+        )
+
+    collector.finalize_cert(
+        cert=cert,
+        issuer=issuer_cert,
+        is_ee_cert=proc_state.is_ee_cert,
+        outcome=outcome,
+        decision=decision,
+        explanation=explanation,
+    )
+
+
+def _has_material(collector, cert, kind: MaterialKind) -> bool:
+    record = collector._records.get(cert.sha256)
+    if record is None:
+        return False
+    if kind == MaterialKind.OCSP:
+        return bool(record.ocsp_evidence)
+    return bool(record.crl_evidence)
+
+
+def _finalize_failed_evidence(
+    *,
+    cert,
+    issuer_cert,
+    validation_context: ValidationContext,
+    proc_state: ValProcState,
+    reason: str,
+    rev_rule: RevocationCheckingRule,
+    cert_has_ocsp: bool,
+    cert_has_crl: bool,
+    ocsp_status_good: bool,
+    crl_status_good: bool,
+):
+    collector = validation_context.evidence_collector
+    if collector is None or issuer_cert is None:
+        return
+    if not isinstance(cert, x509.Certificate):
+        return
+    if (
+        rev_rule.ocsp_relevant
+        and cert_has_ocsp
+        and not ocsp_status_good
+        and not _has_material(collector, cert, MaterialKind.OCSP)
+    ):
+        collector.record_unavailable(
+            cert=cert,
+            issuer=issuer_cert,
+            is_ee_cert=proc_state.is_ee_cert,
+            kind=MaterialKind.OCSP,
+            reason="no usable OCSP evidence contributed to the decision",
+        )
+    if (
+        rev_rule.crl_relevant
+        and cert_has_crl
+        and not crl_status_good
+        and not _has_material(collector, cert, MaterialKind.CRL)
+    ):
+        collector.record_unavailable(
+            cert=cert,
+            issuer=issuer_cert,
+            is_ee_cert=proc_state.is_ee_cert,
+            kind=MaterialKind.CRL,
+            reason="no usable CRL evidence contributed to the decision",
+        )
+    collector.finalize_cert(
+        cert=cert,
+        issuer=issuer_cert,
+        is_ee_cert=proc_state.is_ee_cert,
+        outcome=EvidenceOutcome.FAILED,
+        decision=RevocationDecision.REJECTED_INSUFFICIENT,
+        explanation=reason,
+    )
+
+
+def _finalize_revoked_evidence(
+    *,
+    cert,
+    issuer_cert,
+    validation_context: ValidationContext,
+    proc_state: ValProcState,
+    revinfo_type: str,
+    exc: RevokedError,
+):
+    collector = validation_context.evidence_collector
+    if collector is None or issuer_cert is None:
+        return
+    if not isinstance(cert, x509.Certificate):
+        return
+    explanation = (
+        f"valid, in-scope {revinfo_type} established that the certificate "
+        f"was revoked ({exc.reason.human_friendly}) at "
+        f"{exc.revocation_dt.isoformat()}, at or before the validation "
+        f"time; the path was rejected"
+    )
+    collector.finalize_cert(
+        cert=cert,
+        issuer=issuer_cert,
+        is_ee_cert=proc_state.is_ee_cert,
+        outcome=EvidenceOutcome.REVOKED,
+        decision=RevocationDecision.REJECTED_REVOKED,
+        explanation=explanation,
+    )
 
 
 def _check_aa_controls(
