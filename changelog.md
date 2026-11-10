@@ -1,6 +1,20 @@
 # changelog
 
 
+## 0.26.9 (unreleased)
+
+- Added an optional policy processing trace
+  (`pyhanko_certvalidator.policy_trace`): `validate_path()` and
+  `async_validate_path()` now accept a `policy_trace` parameter that
+  records, in validation order, how the valid policy tree grows and is
+  pruned, how policy mappings connect policy domains, and how the
+  `explicit_policy` / `inhibit_any_policy` / `policy_mapping` state
+  variables evolve. On policy-related validation failures, the trace
+  (also attached to the raised `PathValidationError` as `policy_trace`)
+  preserves the last valid state and the fingerprint of the certificate
+  that caused the failure, and `PolicyTraceRecorder.render()` produces
+  a compact report for reviewers.
+
 ## 0.26.8
 
 - Fixed bug where an HTTP(S) CRL URI appearing next to

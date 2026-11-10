@@ -48,6 +48,7 @@ from .policy_decl import (
     RevocationCheckingRule,
     intersect_policy_sets,
 )
+from .policy_trace import PolicyTraceRecorder
 from .policy_tree import (
     PolicyTreeNode,
     PolicyTreeRoot,
@@ -71,7 +72,10 @@ logger = logging.getLogger(__name__)
 
 
 def validate_path(
-    validation_context, path, parameters: Optional[PKIXValidationParams] = None
+    validation_context,
+    path,
+    parameters: Optional[PKIXValidationParams] = None,
+    policy_trace: Optional[PolicyTraceRecorder] = None,
 ):
     """
     Validates the path using the algorithm from
@@ -96,6 +100,11 @@ def validate_path(
         Additional input parameters to the PKIX validation algorithm.
         These are not used when validating CRLs and OCSP responses.
 
+    :param policy_trace:
+        Optional :class:`.policy_trace.PolicyTraceRecorder` that records
+        how the valid policy tree and the policy-related state variables
+        evolve during validation.
+
     :raises:
         pyhanko_certvalidator.errors.PathValidationError - when an error occurs validating the path
         pyhanko_certvalidator.errors.RevokedError - when the certificate or another certificate in its path has been revoked
@@ -106,7 +115,12 @@ def validate_path(
     """
 
     result = asyncio.run(
-        async_validate_path(validation_context, path, parameters=parameters)
+        async_validate_path(
+            validation_context,
+            path,
+            parameters=parameters,
+            policy_trace=policy_trace,
+        )
     )
     return result
 
@@ -115,6 +129,7 @@ async def async_validate_path(
     validation_context: ValidationContext,
     path: ValidationPath,
     parameters: Optional[PKIXValidationParams] = None,
+    policy_trace: Optional[PolicyTraceRecorder] = None,
 ):
     """
     Validates the path using the algorithm from
@@ -134,6 +149,13 @@ async def async_validate_path(
         Additional input parameters to the PKIX validation algorithm.
         These are not used when validating CRLs and OCSP responses.
 
+    :param policy_trace:
+        Optional :class:`.policy_trace.PolicyTraceRecorder` that records
+        how the valid policy tree and the policy-related state variables
+        evolve during validation. On a policy-related
+        :class:`~.errors.PathValidationError`, the recorder is also
+        available on the exception's ``policy_trace`` attribute.
+
     :raises:
         pyhanko_certvalidator.errors.PathValidationError - when an error occurs validating the path
         pyhanko_certvalidator.errors.RevokedError - when the certificate or another certificate in its path has been revoked
@@ -145,7 +167,11 @@ async def async_validate_path(
 
     proc_state = ValProcState(cert_path_stack=ConsList.sing(path))
     return await intl_validate_path(
-        validation_context, path, parameters=parameters, proc_state=proc_state
+        validation_context,
+        path,
+        parameters=parameters,
+        proc_state=proc_state,
+        policy_trace=policy_trace,
     )
 
 
@@ -762,6 +788,7 @@ class _PathValidationState:
     permitted_subtrees: PermittedSubtrees
     excluded_subtrees: ExcludedSubtrees
     aa_controls_used: bool = False
+    policy_trace: Optional[PolicyTraceRecorder] = None
 
     @staticmethod
     def init_pkix_validation_state(
@@ -862,18 +889,53 @@ class _PathValidationState:
         )
         return state, acceptable_policies
 
-    def update_policy_restrictions(self, cert: x509.Certificate):
+    def update_policy_restrictions(
+        self, cert: x509.Certificate, index: Optional[int] = None
+    ):
+        trace = self.policy_trace
         # Step 3 h
         if not cert.self_issued:
             # Step 3 h 1
             if self.explicit_policy != 0:
+                self._trace_counter(
+                    index, cert, 'explicit_policy', self.explicit_policy,
+                    self.explicit_policy - 1,
+                    'decremented for non-self-issued certificate '
+                    '(RFC 5280 6.1.3 h(1))',
+                )
                 self.explicit_policy -= 1
             # Step 3 h 2
             if self.policy_mapping != 0:
+                self._trace_counter(
+                    index, cert, 'policy_mapping', self.policy_mapping,
+                    self.policy_mapping - 1,
+                    'decremented for non-self-issued certificate '
+                    '(RFC 5280 6.1.3 h(2))',
+                )
                 self.policy_mapping -= 1
             # Step 3 h 3
             if self.inhibit_any_policy != 0:
+                self._trace_counter(
+                    index, cert, 'inhibit_any_policy', self.inhibit_any_policy,
+                    self.inhibit_any_policy - 1,
+                    'decremented for non-self-issued certificate '
+                    '(RFC 5280 6.1.3 h(3))',
+                )
                 self.inhibit_any_policy -= 1
+        elif trace is not None:
+            # self-issued certificates do not advance the counters;
+            # record that explicitly so the trace reflects the difference
+            for counter in (
+                'explicit_policy', 'policy_mapping', 'inhibit_any_policy'
+            ):
+                value = getattr(self, counter)
+                if value != 0:
+                    trace.record_counter(
+                        index=index, cert=cert, counter=counter,
+                        old=value, new=value,
+                        reason='self-issued certificate: not decremented '
+                               '(RFC 5280 6.1.3 h skipped)',
+                    )
 
         # Step 3 i
         policy_constraints = cert.policy_constraints_value
@@ -883,22 +945,50 @@ class _PathValidationState:
                 'require_explicit_policy'
             ].native
             if require_explicit_policy is not None:
-                self.explicit_policy = min(
+                new_explicit_policy = min(
                     self.explicit_policy, require_explicit_policy
                 )
+                self._trace_counter(
+                    index, cert, 'explicit_policy', self.explicit_policy,
+                    new_explicit_policy,
+                    'policyConstraints requireExplicitPolicy=%d '
+                    '(RFC 5280 6.1.3 i(1))' % require_explicit_policy,
+                )
+                self.explicit_policy = new_explicit_policy
             # Step 3 i 2
             inhibit_policy_mapping = policy_constraints[
                 'inhibit_policy_mapping'
             ].native
             if inhibit_policy_mapping is not None:
-                self.policy_mapping = min(
+                new_policy_mapping = min(
                     self.policy_mapping, inhibit_policy_mapping
                 )
+                self._trace_counter(
+                    index, cert, 'policy_mapping', self.policy_mapping,
+                    new_policy_mapping,
+                    'policyConstraints inhibitPolicyMapping=%d '
+                    '(RFC 5280 6.1.3 i(2))' % inhibit_policy_mapping,
+                )
+                self.policy_mapping = new_policy_mapping
 
         # Step 3 j
         if cert.inhibit_any_policy_value is not None:
-            self.inhibit_any_policy = min(
+            new_inhibit_any_policy = min(
                 cert.inhibit_any_policy_value.native, self.inhibit_any_policy
+            )
+            self._trace_counter(
+                index, cert, 'inhibit_any_policy', self.inhibit_any_policy,
+                new_inhibit_any_policy,
+                'inhibitAnyPolicy extension=%d (RFC 5280 6.1.3 j)'
+                % cert.inhibit_any_policy_value.native,
+            )
+            self.inhibit_any_policy = new_inhibit_any_policy
+
+    def _trace_counter(self, index, cert, counter, old, new, reason):
+        if self.policy_trace is not None and old != new:
+            self.policy_trace.record_counter(
+                index=index, cert=cert, counter=counter,
+                old=old, new=new, reason=reason,
             )
 
     def process_policies(
@@ -907,7 +997,14 @@ class _PathValidationState:
         certificate_policies,
         any_policy_uninhibited,
         proc_state: ValProcState,
+        cert: Optional[x509.Certificate] = None,
     ):
+        trace = self.policy_trace
+        tree_before = (
+            trace.snapshot_tree(self.valid_policy_tree)
+            if trace is not None
+            else None
+        )
         if certificate_policies and self.valid_policy_tree is not None:
             self.valid_policy_tree = update_policy_tree(
                 certificate_policies,
@@ -920,13 +1017,36 @@ class _PathValidationState:
         elif certificate_policies is None:
             self.valid_policy_tree = None
 
+        if trace is not None and cert is not None:
+            trace.record_cert_policies(
+                index=index,
+                cert=cert,
+                self_issued=bool(cert.self_issued),
+                is_leaf=index == proc_state.path_len,
+                asserted_policies=(
+                    None
+                    if certificate_policies is None
+                    else frozenset(
+                        policy['policy_identifier'].native
+                        for policy in certificate_policies
+                    )
+                ),
+                any_policy_uninhibited=any_policy_uninhibited,
+                tree_before=tree_before,
+                tree_after=self.valid_policy_tree,
+            )
+
         # Step 2 f
         if self.valid_policy_tree is None and self.explicit_policy <= 0:
-            raise PathValidationError.from_state(
-                "The path could not be validated because there is no valid set "
-                f"of policies for {proc_state.describe_cert()}",
-                proc_state,
+            msg = (
+                "The path could not be validated because there is no valid "
+                f"set of policies for {proc_state.describe_cert()}"
             )
+            err = PathValidationError.from_state(msg, proc_state)
+            if trace is not None:
+                trace.record_failure(index=index, cert=cert, message=msg)
+                err.policy_trace = trace
+            raise err
 
     def check_name_constraints(self, cert, proc_state: ValProcState):
         # name constraint processing
@@ -1029,6 +1149,7 @@ async def intl_validate_path(
     path: ValidationPath,
     proc_state: ValProcState,
     parameters: Optional[PKIXValidationParams] = None,
+    policy_trace: Optional[PolicyTraceRecorder] = None,
 ):
     """
     Internal copy of validate_path() that allows overriding the name of the
@@ -1050,6 +1171,10 @@ async def intl_validate_path(
         Additional input parameters to the PKIX validation algorithm.
         These are not used when validating CRLs and OCSP responses.
 
+    :param policy_trace:
+        Optional :class:`.policy_trace.PolicyTraceRecorder` that records
+        policy processing decisions taken during validation.
+
     :return:
         The final certificate in the path - an instance of
         asn1crypto.x509.Certificate
@@ -1070,6 +1195,16 @@ async def intl_validate_path(
     ) = _PathValidationState.init_pkix_validation_state(
         path_length, trust_anchor, parameters
     )
+    if policy_trace is not None:
+        state.policy_trace = policy_trace
+        policy_trace.record_initialisation(
+            path_length=path_length,
+            explicit_policy=state.explicit_policy,
+            inhibit_any_policy=state.inhibit_any_policy,
+            policy_mapping=state.policy_mapping,
+            acceptable_policies=acceptable_policies,
+            initial_tree=state.valid_policy_tree,
+        )
 
     # Step 2: basic processing
     completed_path: ValidationPath = ValidationPath(
@@ -1152,6 +1287,7 @@ async def intl_validate_path(
                 or (index < path_length and cert.self_issued)
             ),
             proc_state=proc_state,
+            cert=cert,
         )
 
         if index < path_length:
@@ -1220,14 +1356,33 @@ def _check_validity(
 def _finish_policy_processing(
     state, cert, acceptable_policies, path_length, proc_state: ValProcState
 ):
+    trace = state.policy_trace
     # Step 4 a
     if state.explicit_policy != 0:
+        if trace is not None:
+            trace.record_counter(
+                index=None, cert=cert, counter='explicit_policy',
+                old=state.explicit_policy, new=state.explicit_policy - 1,
+                reason='wrap-up decrement (RFC 5280 6.1.4 a)',
+            )
         state.explicit_policy -= 1
     # Step 4 b
     if cert.policy_constraints_value:
         if cert.policy_constraints_value['require_explicit_policy'].native == 0:
+            if trace is not None and state.explicit_policy != 0:
+                trace.record_counter(
+                    index=None, cert=cert, counter='explicit_policy',
+                    old=state.explicit_policy, new=0,
+                    reason='leaf policyConstraints requireExplicitPolicy=0 '
+                           '(RFC 5280 6.1.4 b)',
+                )
             state.explicit_policy = 0
     # Step 4 g
+    tree_before = (
+        trace.snapshot_tree(state.valid_policy_tree)
+        if trace is not None
+        else None
+    )
     # Step 4 g i
     intersection: Optional[PolicyTreeRoot]
     if state.valid_policy_tree is None:
@@ -1246,7 +1401,7 @@ def _finish_policy_processing(
     if intersection is not None:
         # collect policies in a user-friendly format and attach them to the
         # path object
-        def _enum_policies() -> Iterable[QualifiedPolicy]:
+        def _enum_policies():
             accepted_policy: PolicyTreeNode
             assert intersection is not None
             for accepted_policy in intersection.at_depth(path_length):
@@ -1271,15 +1426,39 @@ def _finish_policy_processing(
                     user_domain_policy_id=user_domain_policy_id,
                     issuer_domain_policy_id=listed_pol,
                     qualifiers=frozenset(accepted_policy.qualifier_set),
-                )
+                ), accepted_policy
 
-        qualified_policies = frozenset(_enum_policies())
-    elif state.explicit_policy == 0:
-        raise PathValidationError.from_state(
-            f"The path could not be validated because there is no valid set of "
-            f"policies for {proc_state.describe_cert()}.",
-            proc_state,
+        qualified_with_nodes = list(_enum_policies())
+        qualified_policies = frozenset(
+            qual_policy for qual_policy, _ in qualified_with_nodes
         )
+        if trace is not None:
+            trace.record_intersection(
+                acceptable_policies=acceptable_policies,
+                explicit_policy=state.explicit_policy,
+                tree_before=tree_before,
+                tree_after=intersection,
+                qualified=qualified_with_nodes,
+            )
+    elif state.explicit_policy == 0:
+        msg = (
+            "The path could not be validated because there is no valid set of "
+            f"policies for {proc_state.describe_cert()}."
+        )
+        err = PathValidationError.from_state(msg, proc_state)
+        if trace is not None:
+            trace.record_intersection(
+                acceptable_policies=acceptable_policies,
+                explicit_policy=state.explicit_policy,
+                tree_before=tree_before,
+                tree_after=None,
+                qualified=(),
+            )
+            trace.record_failure(
+                index=proc_state.index, cert=cert, message=msg
+            )
+            err.policy_trace = trace
+        raise err
     return qualified_policies
 
 
@@ -1485,17 +1664,48 @@ def _prepare_next_step(
     proc_state: ValProcState,
 ):
     if cert.policy_mappings_value:
-        policy_map = enumerate_policy_mappings(
-            cert.policy_mappings_value, proc_state=proc_state
+        trace = state.policy_trace
+        tree_before = (
+            trace.snapshot_tree(state.valid_policy_tree)
+            if trace is not None
+            else None
         )
+        try:
+            policy_map = enumerate_policy_mappings(
+                cert.policy_mappings_value, proc_state=proc_state
+            )
+        except PathValidationError as e:
+            if trace is not None:
+                trace.record_failure(
+                    index=index, cert=cert, message=e.failure_msg
+                )
+                e.policy_trace = trace
+            raise
 
         # Step 3 b
+        mapping_uninhibited = state.policy_mapping > 0
         if state.valid_policy_tree is not None:
             state.valid_policy_tree = apply_policy_mapping(
                 policy_map,
                 state.valid_policy_tree,
                 depth=index,
-                policy_mapping_uninhibited=state.policy_mapping > 0,
+                policy_mapping_uninhibited=mapping_uninhibited,
+            )
+        if trace is not None:
+            trace.record_policy_mapping(
+                index=index,
+                cert=cert,
+                mappings=tuple(
+                    sorted(
+                        (issuer_pol, subject_pol)
+                        for issuer_pol, subject_pols in policy_map.items()
+                        for subject_pol in subject_pols
+                    )
+                ),
+                mapping_uninhibited=mapping_uninhibited,
+                policy_mapping_counter=state.policy_mapping,
+                tree_before=tree_before,
+                tree_after=state.valid_policy_tree,
             )
 
     # Step 3 c
@@ -1536,7 +1746,7 @@ def _prepare_next_step(
             )
 
     # Step 3 h-j
-    state.update_policy_restrictions(cert)
+    state.update_policy_restrictions(cert, index=index)
 
     # Step 3 k
     if not cert.ca:
