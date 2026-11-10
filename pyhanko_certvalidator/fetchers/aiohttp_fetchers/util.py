@@ -1,4 +1,3 @@
-import asyncio
 from typing import Any, Dict, Union
 
 import aiohttp
@@ -36,7 +35,7 @@ class AIOHttpMixin:
         self.user_agent = user_agent or DEFAULT_USER_AGENT
         self.per_request_timeout = per_request_timeout
         self.__results: Dict[Any, Any] = {}
-        self.__result_events: Dict[Any, asyncio.Event] = {}
+        self.__running_jobs: Dict[Any, Any] = {}
         super().__init__()
 
     async def get_session(self) -> aiohttp.ClientSession:
@@ -63,5 +62,5 @@ class AIOHttpMixin:
 
     async def _post_fetch_task(self, tag, async_fun):
         return await queue_fetch_task(
-            self.__results, self.__result_events, tag, async_fun
+            self.__results, self.__running_jobs, tag, async_fun
         )

@@ -219,18 +219,65 @@ T = TypeVar('T')
 R = TypeVar('R')
 
 
-async def queue_fetch_task(
+class _FetchJob:
+    """
+    Bookkeeping for an in-flight fetch job shared between coroutines.
+
+    The job entry (held in the ``running_jobs`` registry) owns the background
+    task that performs the fetch; its lifetime is tied to the registry entry,
+    not to any individual waiting coroutine. ``waiters`` counts the coroutines
+    currently awaiting the outcome.
+    """
+
+    __slots__ = ('task', 'waiters')
+
+    def __init__(self, task: 'asyncio.Task'):
+        self.task = task
+        self.waiters = 0
+
+
+async def _run_fetch_job(
     results: Dict[T, Union[R, Exception]],
-    running_jobs: Dict[T, asyncio.Event],
     tag: T,
     async_fun: Callable[[], Awaitable[R]],
 ) -> Union[R, Exception]:
-    # use an asyncio events to make sure that we don't attempt to re-fetch
-    # the same tag while the job is running
-    # Note: this uses asyncio locking, so we only transfer control
-    # on 'await'.
-    # We use events instead of locks because we don't care about fairness,
-    # and events are easier to reason about.
+    try:
+        result = await async_fun()
+    except asyncio.CancelledError:
+        # A cancelled fetch produced nothing, so nothing may be cached:
+        # a later request for the same tag must be allowed to retry.
+        logger.debug(f"Fetch job with tag {repr(tag)} was cancelled.")
+        raise
+    except Exception as e:
+        logger.debug(f"Fetch job with tag {repr(tag)} threw an exception: {e}")
+        result = e
+    results[tag] = result
+    logger.debug(f"Fetch job with tag {repr(tag)} returned.")
+    return result
+
+
+async def queue_fetch_task(
+    results: Dict[T, Union[R, Exception]],
+    running_jobs: Dict[T, _FetchJob],
+    tag: T,
+    async_fun: Callable[[], Awaitable[R]],
+) -> Union[R, Exception]:
+    # Deduplicate concurrent fetches for the same tag: the first request
+    # registers a job in ``running_jobs``, subsequent ones await the same job.
+    #
+    # Ownership & cancellation policy:
+    #  - The fetch runs in a background task owned by the job entry in
+    #    ``running_jobs``, not by the coroutine that happened to start it.
+    #  - Every waiter (including the first one) awaits the task under
+    #    asyncio.shield(), so cancelling one waiter does not cancel the
+    #    shared fetch or disturb the remaining waiters.
+    #  - The background task is only cancelled when its last waiter leaves
+    #    before completion; the registry entry is dropped at the same time,
+    #    so no orphaned background tasks or stale entries are left behind.
+    #  - Only outcomes that were actually produced are cached in ``results``;
+    #    in particular, a cancelled fetch stores nothing.
+    # Note: there are no 'await' points between the cache/registry lookups
+    # and the refcount update, so these steps are effectively atomic.
     try:
         result = results[tag]
         logger.debug(
@@ -239,33 +286,32 @@ async def queue_fetch_task(
         return _return_or_raise(result)
     except KeyError:
         pass
-    try:
-        wait_event: asyncio.Event = running_jobs[tag]
-        logger.debug(f"Waiting for fetch job with tag {repr(tag)} to return...")
-        # there's a fetch job running, wait for it to finish and then
-        # return the result
-        await wait_event.wait()
-        logger.debug(
-            f"Received completion signal for job with tag {repr(tag)}."
-        )
-        return _return_or_raise(results[tag])
-    except KeyError:
+
+    job = running_jobs.get(tag)
+    if job is None:
         logger.debug(f"Starting new fetch job with tag {repr(tag)}...")
-        # no fetch job running, run the task and store the result
-        running_jobs[tag] = wait_event = asyncio.Event()
-        try:
-            result = await async_fun()
-        except Exception as e:
-            logger.debug(
-                f"New fetch job with tag {repr(tag)} threw an exception: {e}"
-            )
-            result = e
-        results[tag] = result
-        logger.debug(f"New fetch job with tag {repr(tag)} returned.")
-        # deregister event, notify waiters
-        del running_jobs[tag]
-        wait_event.set()
+        job = _FetchJob(
+            asyncio.ensure_future(_run_fetch_job(results, tag, async_fun))
+        )
+        running_jobs[tag] = job
+    else:
+        logger.debug(f"Waiting for fetch job with tag {repr(tag)} to return...")
+
+    job.waiters += 1
+    try:
+        result = await asyncio.shield(job.task)
         return _return_or_raise(result)
+    finally:
+        job.waiters -= 1
+        if job.waiters == 0:
+            if not job.task.done():
+                logger.debug(
+                    f"Cancelling fetch job with tag {repr(tag)}: "
+                    f"no waiters left."
+                )
+                job.task.cancel()
+            if running_jobs.get(tag) is job:
+                del running_jobs[tag]
 
 
 def _return_or_raise(result):

@@ -15,7 +15,7 @@ class RequestsFetcherMixin:
         self.user_agent = user_agent or DEFAULT_USER_AGENT
         self.per_request_timeout = per_request_timeout
         self.__results = {}
-        self.__result_events = {}
+        self.__running_jobs = {}
 
     def get_results(self):
         return {
@@ -34,7 +34,7 @@ class RequestsFetcherMixin:
 
     async def _perform_fetch(self, tag, fetch_fun):
         return await queue_fetch_task(
-            self.__results, self.__result_events, tag, fetch_fun
+            self.__results, self.__running_jobs, tag, fetch_fun
         )
 
     def _get(
