@@ -26,8 +26,14 @@ class AIOHttpOCSPFetcher(OCSPFetcher, AIOHttpMixin):
         per_request_timeout=10,
         certid_hash_algo='sha1',
         request_nonces=True,
+        network_policy=None,
     ):
-        super().__init__(session, user_agent, per_request_timeout)
+        super().__init__(
+            session,
+            user_agent,
+            per_request_timeout,
+            network_policy=network_policy,
+        )
         if certid_hash_algo not in ('sha1', 'sha256'):
             raise ValueError(
                 f'certid_hash_algo must be one of "sha1", "sha256", not '
@@ -81,6 +87,12 @@ class AIOHttpOCSPFetcher(OCSPFetcher, AIOHttpMixin):
             f"{';'.join(ocsp_urls)}..."
         )
         session = await self.get_session()
+        if self.network_policy is not None:
+            fetch_jobs = (
+                self._grab_ocsp_guarded(ocsp_request, ocsp_url)
+                for ocsp_url in ocsp_urls
+            )
+            return await ocsp_job_get_earliest(fetch_jobs)
         fetch_jobs = (
             _grab_ocsp(
                 ocsp_request,
@@ -92,6 +104,29 @@ class AIOHttpOCSPFetcher(OCSPFetcher, AIOHttpMixin):
             for ocsp_url in ocsp_urls
         )
         return await ocsp_job_get_earliest(fetch_jobs)
+
+    async def _grab_ocsp_guarded(self, ocsp_request, ocsp_url):
+        try:
+            logger.info(
+                f"Requesting OCSP response from {ocsp_url}..."
+            )
+            headers = {
+                'Accept': 'application/ocsp-response',
+                'Content-Type': 'application/ocsp-request',
+                'User-Agent': self.user_agent,
+            }
+            response = await self._guarded_request(
+                'POST', ocsp_url, headers, ocsp_request.dump()
+            )
+            return process_ocsp_response_data(
+                response.content,
+                ocsp_request=ocsp_request,
+                ocsp_url=ocsp_url,
+            )
+        except (aiohttp.ClientError, errors.OCSPValidationError) as e:
+            raise errors.OCSPFetchError(
+                f"Failed to fetch OCSP response from {ocsp_url}",
+            ) from e
 
     def fetched_responses(self) -> Iterable[ocsp.OCSPResponse]:
         return self.get_results()

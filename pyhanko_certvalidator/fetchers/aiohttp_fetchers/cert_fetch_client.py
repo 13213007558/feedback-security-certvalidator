@@ -27,8 +27,14 @@ class AIOHttpCertificateFetcher(CertificateFetcher, AIOHttpMixin):
         user_agent=None,
         per_request_timeout=10,
         permit_pem=True,
+        network_policy=None,
     ):
-        super().__init__(session, user_agent, per_request_timeout)
+        super().__init__(
+            session,
+            user_agent,
+            per_request_timeout,
+            network_policy=network_policy,
+        )
         self.permit_pem = permit_pem
 
     async def fetch_certs(self, url, url_origin_type):
@@ -49,6 +55,10 @@ class AIOHttpCertificateFetcher(CertificateFetcher, AIOHttpMixin):
         async def task():
             try:
                 logger.info(f"Fetching certificates from {url}...")
+                if self.network_policy is not None:
+                    return await self._grab_certs_guarded(
+                        url, url_origin_type=url_origin_type
+                    )
                 return await _grab_certs(
                     url,
                     permit_pem=self.permit_pem,
@@ -89,6 +99,44 @@ class AIOHttpCertificateFetcher(CertificateFetcher, AIOHttpMixin):
 
     def fetched_certs(self) -> Iterable[x509.Certificate]:
         return self.get_results()
+
+    async def _grab_certs_guarded(self, url, *, url_origin_type):
+        permit_pem = self.permit_pem
+        if permit_pem:
+            acceptable_cts = (
+                ACCEPTABLE_STRICT_CERT_CONTENT_TYPES
+                | ACCEPTABLE_CERT_PEM_ALIASES
+                | ACCEPTABLE_CERT_DER_ALIASES
+                | ACCEPTABLE_PKCS7_DER_ALIASES
+            )
+        else:
+            acceptable_cts = ACCEPTABLE_STRICT_CERT_CONTENT_TYPES
+
+        headers = {
+            'Accept': ','.join(acceptable_cts),
+            'User-Agent': self.user_agent,
+        }
+        response = await self._guarded_request('GET', url, headers, None)
+        try:
+            content_type = response.headers['Content-Type'].strip()
+            if content_type not in acceptable_cts:
+                ct_err = (
+                    f"Unacceptable content type '{repr(content_type)}' "
+                    f"when fetching issuer certificate for {url_origin_type} "
+                    f"from URL {url}."
+                )
+                raise aiohttp.ContentTypeError(
+                    None,
+                    None,
+                    message=ct_err,
+                    headers=response.headers,
+                )
+        except KeyError:
+            content_type = None
+        certs = unpack_cert_content(
+            response.content, content_type, url, permit_pem
+        )
+        return list(certs)
 
 
 async def _grab_certs(

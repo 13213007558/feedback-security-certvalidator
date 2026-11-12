@@ -27,9 +27,17 @@ class RequestsCertificateFetcher(CertificateFetcher, RequestsFetcherMixin):
     """
 
     def __init__(
-        self, user_agent=None, per_request_timeout=10, permit_pem=True
+        self,
+        user_agent=None,
+        per_request_timeout=10,
+        permit_pem=True,
+        network_policy=None,
     ):
-        super().__init__(user_agent, per_request_timeout)
+        super().__init__(
+            user_agent,
+            per_request_timeout,
+            network_policy=network_policy,
+        )
         self.permit_pem = permit_pem
 
     async def fetch_certs(self, url, url_origin_type):

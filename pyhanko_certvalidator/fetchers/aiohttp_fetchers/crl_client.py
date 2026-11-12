@@ -22,8 +22,14 @@ class AIOHttpCRLFetcher(CRLFetcher, AIOHttpMixin):
         session: Union[aiohttp.ClientSession, LazySession],
         user_agent=None,
         per_request_timeout=10,
+        network_policy=None,
     ):
-        super().__init__(session, user_agent, per_request_timeout)
+        super().__init__(
+            session,
+            user_agent,
+            per_request_timeout,
+            network_policy=network_policy,
+        )
         self._by_cert: Dict[bytes, List[crl.CertificateList]] = {}
 
     async def fetch(
@@ -69,6 +75,8 @@ class AIOHttpCRLFetcher(CRLFetcher, AIOHttpMixin):
 
     async def _single_fetch(self, url):
         async def task():
+            if self.network_policy is not None:
+                return await self._grab_crl_guarded(url)
             return await _grab_crl(
                 url,
                 user_agent=self.user_agent,
@@ -77,6 +85,25 @@ class AIOHttpCRLFetcher(CRLFetcher, AIOHttpMixin):
             )
 
         return await self._post_fetch_task(url, task)
+
+    async def _grab_crl_guarded(self, url):
+        try:
+            logger.info(f"Requesting CRL from {url}...")
+            headers = {
+                'Accept': 'application/pkix-crl',
+                'User-Agent': self.user_agent,
+            }
+            response = await self._guarded_request(
+                'GET', url, headers, None
+            )
+            data = response.content
+            if pem.detect(data):
+                _, _, data = pem.unarmor(data)
+            return crl.CertificateList.load(data)
+        except (ValueError, aiohttp.ClientError) as e:
+            raise errors.CRLFetchError(
+                f"Failure to fetch CRL from URL {url}"
+            ) from e
 
     def fetched_crls(self) -> Iterable[crl.CertificateList]:
         return {crl_ for crl_ in self.get_results()}

@@ -25,8 +25,13 @@ class RequestsOCSPFetcher(OCSPFetcher, RequestsFetcherMixin):
         per_request_timeout=10,
         certid_hash_algo='sha1',
         request_nonces=True,
+        network_policy=None,
     ):
-        super().__init__(user_agent, per_request_timeout)
+        super().__init__(
+            user_agent,
+            per_request_timeout,
+            network_policy=network_policy,
+        )
         if certid_hash_algo not in ('sha1', 'sha256'):
             raise ValueError(
                 f'certid_hash_algo must be one of "sha1", "sha256", not '

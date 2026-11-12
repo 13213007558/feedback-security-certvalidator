@@ -1,6 +1,20 @@
 # changelog
 
 
+## Unreleased
+
+- Added an optional, backend-agnostic network admission policy
+  (`NetworkAdmissionPolicy`) for the built-in `requests` and `aiohttp`
+  fetcher backends. When enabled, AIA/CRL/OCSP downloads are constrained by
+  scheme, host/name and IP allow-lists, ports, a redirect cap, a response
+  body size limit and per-request timeouts. The initial URL and every
+  redirect target are re-validated, and DNS-resolved connection addresses
+  are checked through a pluggable resolver so DNS rebinding, localhost
+  aliases and IPv4-mapped addresses cannot reach internal services.
+  Policy denials raise a dedicated `NetworkPolicyError` that is never
+  downgraded to a "missing material" fetch error.
+
+
 ## 0.26.8
 
 - Fixed bug where an HTTP(S) CRL URI appearing next to

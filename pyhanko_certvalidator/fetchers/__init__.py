@@ -1,4 +1,14 @@
 from .api import *
+from .network_policy import (
+    DEFAULT_MAX_REDIRECTS,
+    DEFAULT_MAX_RESPONSE_SIZE,
+    DEFAULT_REQUEST_TIMEOUT,
+    DefaultHostResolver,
+    HostResolver,
+    NetworkAdmissionPolicy,
+    NetworkPolicyError,
+    PolicyDenialReason,
+)
 
 __all__ = [
     'Fetchers',
@@ -7,6 +17,14 @@ __all__ = [
     'CRLFetcher',
     'CertificateFetcher',
     'default_fetcher_backend',
+    'NetworkAdmissionPolicy',
+    'NetworkPolicyError',
+    'PolicyDenialReason',
+    'HostResolver',
+    'DefaultHostResolver',
+    'DEFAULT_MAX_REDIRECTS',
+    'DEFAULT_MAX_RESPONSE_SIZE',
+    'DEFAULT_REQUEST_TIMEOUT',
 ]
 
 
